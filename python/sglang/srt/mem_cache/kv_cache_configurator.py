@@ -212,6 +212,13 @@ if TYPE_CHECKING:
     )
 
 
+def _qsa_ring_size(compress_ratio: int) -> int:
+    """Per-request QSA pending-ring slots: a request's window of D rows plus
+    the up to ratio - 1 older members of a group it completes, in whole groups."""
+    window = max_speculative_num_draft_tokens() or 1
+    return compress_ratio * -(-(compress_ratio - 1 + window) // compress_ratio)
+
+
 class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
     max_total_num_tokens: int
     max_running_requests: int
@@ -1923,6 +1930,7 @@ class KVCacheConfigurator:
                 qsa_compress_ratio=qsa_profile.compress_ratio,
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
+                qsa_ring_size=_qsa_ring_size(qsa_profile.compress_ratio),
             )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,

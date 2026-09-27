@@ -114,6 +114,7 @@ def _qsa_graph_row_metadata_kernel(
     req_pages_ptr,
     req_pages_row_stride,
     RATIO: tl.constexpr,
+    RING: tl.constexpr,  # pending-ring slots per request
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
     CPS: tl.constexpr,  # compressed slots per page
     PAGE_BLOCK: tl.constexpr,
@@ -145,11 +146,11 @@ def _qsa_graph_row_metadata_kernel(
     tl.store(write_locs_ptr + row, write_loc)
 
     tl.store(logical_positions_ptr + row, current)
-    tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
+    tl.store(state_slots_ptr + row, req * RING + (current % RING).to(tl.int64))
     ring_base = row.to(tl.int64) * RATIO
     for k in tl.static_range(RATIO):
         member = tl.maximum(current - (RATIO - 1 - k), 0)
-        slot = req * RATIO + (member % RATIO).to(tl.int64)
+        slot = req * RING + (member % RING).to(tl.int64)
         tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
 
     # Page-table entries are compressed page ids.  Physical: the request's
@@ -254,6 +255,7 @@ def launch_graph_metadata(
         req_pages,
         req_pages_stride,
         RATIO=indexer.compress_ratio,
+        RING=pool.qsa_ring_size,
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
         CPS=pool.qsa_compressed_page_size,
         PAGE_BLOCK=128,
