@@ -1,12 +1,18 @@
 from typing import Optional
 
 import msgspec
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
-from sglang.srt.layers.hc_gemm import hc_gemm, prepare as _hc_gemm_prepare
+from sglang.srt.layers.hc_gemm import (
+    hc_combine_small,
+    hc_gemm,
+    hc_mix_tail,
+    prepare as _hc_gemm_prepare,
+)
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -182,6 +188,37 @@ class GatedResidual(HyperConnectionBase):
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
 
+        def _mix_tail(
+            input_mix_weight: torch.Tensor,
+            hyper_input_normed: torch.Tensor,
+            hc: int,
+            hs: int,
+        ) -> torch.Tensor:
+            input_mix_weight = torch.sigmoid(input_mix_weight)
+            input_mix_weight = input_mix_weight.unflatten(-1, (hc, hs))
+            return (
+                input_mix_weight * hyper_input_normed.unflatten(-1, (hc, hs))
+            ).mean(dim=-2)
+
+        def _combine_tail(
+            block_output: torch.Tensor,
+            residual: torch.Tensor,
+            block_inject_weight_out: torch.Tensor,
+            hc: int,
+            hs: int,
+        ) -> torch.Tensor:
+            R = residual.unflatten(-1, (hc, hs))
+            injection = block_output.unsqueeze(-2) * block_inject_weight_out.unsqueeze(
+                -1
+            )
+            return (R + injection).flatten(-2)
+
+        # Diagnostic switch: rows <= fusion_min_rows use the eager tail (the
+        # pre-fusion rounding), larger rows use the compiled tail. 0 keeps the
+        # compiled tail for every row count.
+        fusion_min_rows = int(os.environ.get("SGLANG_HC_FUSION_MIN_ROWS", "0"))
+        tail_legacy = os.environ.get("SGLANG_HC_TAIL_LEGACY") == "1"
+
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
             input_mix_weight_down: torch.Tensor,
@@ -193,12 +230,11 @@ class GatedResidual(HyperConnectionBase):
                 hc_gemm(hyper_input_normed, input_mix_weight_down) / hc
             )
             input_mix_weight = hc_gemm(input_mix_weight, input_mix_weight_up)
-            input_mix_weight = torch.sigmoid(input_mix_weight)
-            input_mix_weight = input_mix_weight.unflatten(-1, (hc, hs))
-            output = (
-                input_mix_weight * hyper_input_normed.unflatten(-1, (hc, hs))
-            ).mean(dim=-2)
-            return output
+            if tail_legacy:
+                if input_mix_weight.shape[0] > fusion_min_rows:
+                    return _mix_tail(input_mix_weight, hyper_input_normed, hc, hs)
+                return _mix_tail_eager(input_mix_weight, hyper_input_normed, hc, hs)
+            return hc_mix_tail(input_mix_weight, hyper_input_normed, hc, hs)
 
         def _combine_compute(
             block_output: torch.Tensor,
@@ -208,15 +244,34 @@ class GatedResidual(HyperConnectionBase):
             hc: int,
             hs: int,
         ) -> torch.Tensor:
-            R = residual.unflatten(-1, (hc, hs))
+            if not os.path.exists("/diag/legacy_combine"):
+                # Fused deterministic gate + apply for every row count: the
+                # split-K order is fixed, so the result is M-independent.
+                return hc_combine_small(
+                    block_output,
+                    residual,
+                    normed_residual,
+                    block_inject_weight,
+                    hc,
+                    hs,
+                )
             block_inject_weight_out = 2 * torch.sigmoid(
                 hc_gemm(normed_residual, block_inject_weight) / hc
             )
-            injection = block_output.unsqueeze(-2) * block_inject_weight_out.unsqueeze(
-                -1
+            if block_inject_weight_out.shape[0] > fusion_min_rows:
+                return _combine_tail(
+                    block_output, residual, block_inject_weight_out, hc, hs
+                )
+            return _combine_tail_eager(
+                block_output, residual, block_inject_weight_out, hc, hs
             )
-            return (R + injection).flatten(-2)
 
+        _mix_tail_eager = _mix_tail
+        _combine_tail_eager = _combine_tail
+        _mix_tail = torch.compile(_mix_tail)
+        _combine_tail = torch.compile(_combine_tail)
+        self._mix_tail = _mix_tail
+        self._combine_tail = _combine_tail
         self._mix_compute = _mix_compute
         self._combine_compute = _combine_compute
         if self.input_mix_weight_down.weight.device.type == "cuda":

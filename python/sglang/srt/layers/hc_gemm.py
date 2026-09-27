@@ -21,6 +21,12 @@ os.environ.setdefault("CUTE_DSL_CACHE_DIR", "/root/.cache/sglang/cute-dsl")
 
 HC_GEMM_THRESHOLD = 256
 _SMALL_TILE = (16, 32, 64)
+# Small-M shapes measured better with narrower tiles on GB10 (probe_smallm):
+_SMALL_TILES = {
+    (320, 10240): (8, 16, 64),
+    (10240, 320): (8, 128, 64),
+    (4, 10240): (8, 16, 64),
+}
 _CUTE_TILES = {
     # hyperconnection
     (320, 10240): (64, 128, 64),
@@ -82,7 +88,7 @@ def _hc_gemm_small_kernel(
 def _launch_small(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
     m, k = x.shape
     n = weight.shape[0]
-    bm, bn, bk = _SMALL_TILE
+    bm, bn, bk = _SMALL_TILES.get((n, k), _SMALL_TILE)
     grid = (triton.cdiv(m, bm), triton.cdiv(n, bn))
     _hc_gemm_small_kernel[grid](
         x, weight, out,
@@ -93,6 +99,230 @@ def _launch_small(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> N
         BM=bm, BN=bn, BK=bk,
         num_warps=4, num_stages=3,
     )
+
+
+_GATE_SPLITS = 32
+_GATE_TILE_BM = 16
+_COMBINE_BN = 512
+_GATE_SCRATCH: dict[int, "torch.Tensor"] = {}
+# Captured CUDA graphs hold the scratch pointer; a later prefill call grows the
+# buffer, so the old tensor must stay alive instead of being freed.
+_GATE_SCRATCH_RETIRED: list["torch.Tensor"] = []
+
+
+@triton.jit
+def _round_bf16(x):
+    """Force a round-to-nearest-even f32 -> bf16 conversion.
+
+    ``x.to(tl.bfloat16).to(tl.float32)`` can be folded back to the f32 value by
+    the compiler (the intermediate rounding is lost), so the eager rounding
+    chain cannot be reproduced with a plain cast.  The inline PTX keeps it.
+    """
+
+    return tl.inline_asm_elementwise(
+        "cvt.rn.bf16.f32 $0, $1;", "=h,r", [x], dtype=tl.bfloat16, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _hc_gate_partial_kernel(
+    normed_ptr, weight_ptr, partial_ptr,
+    M, K, HC,
+    stride_nm, stride_nk, stride_wn, stride_wk,
+    stride_ps, stride_pm, stride_pc,
+    SPLITS: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, NP: tl.constexpr,
+):
+    s = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    mask_m = offs_m < M
+    offs_n = tl.arange(0, NP)
+    offs_k = tl.arange(0, BK)
+    chunk = tl.cdiv(K, SPLITS)
+    start = s * chunk
+    stop = tl.minimum(start + chunk, K)
+    acc = tl.zeros((BM, NP), dtype=tl.float32)
+    for k0 in range(start, stop, BK):
+        offs = k0 + offs_k
+        mask_k = offs < K
+        a = tl.load(
+            normed_ptr + offs_m[:, None] * stride_nm + offs[None, :] * stride_nk,
+            mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+        )
+        w = tl.load(
+            weight_ptr + offs_n[None, :] * stride_wn + offs[:, None] * stride_wk,
+            mask=(offs_n[None, :] < HC) & mask_k[:, None], other=0.0,
+        )
+        acc = tl.dot(a, w, acc)
+    tl.store(
+        partial_ptr + s * stride_ps + offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pc,
+        acc, mask=mask_m[:, None] & (offs_n[None, :] < HC),
+    )
+
+
+@triton.jit
+def _hc_combine_apply_kernel(
+    block_ptr, residual_ptr, partial_ptr, out_ptr,
+    M, HS,
+    stride_bm, stride_bh,
+    stride_rm, stride_rk,
+    stride_ps, stride_pm, stride_pc,
+    stride_om, stride_ok,
+    SPLITS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, HC: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    mask_m = offs_m < M
+    offs_hc = tl.arange(0, HC)
+    gate = tl.zeros((BM, HC), dtype=tl.float32)
+    for s in range(SPLITS):
+        gate += tl.load(
+            partial_ptr + s * stride_ps + offs_m[:, None] * stride_pm
+            + offs_hc[None, :] * stride_pc,
+            mask=mask_m[:, None], other=0.0,
+        )
+    # Reproduce the eager rounding chain: bf16 GEMM out, /hc -> bf16,
+    # sigmoid -> bf16, *2 -> bf16.
+    gate = _round_bf16(gate)
+    scaled = _round_bf16(gate.to(tl.float32) / HC)
+    sig = _round_bf16(tl.sigmoid(scaled.to(tl.float32)))
+    weight_out = _round_bf16(2.0 * sig.to(tl.float32))
+
+    offs_hs = pid_n * BN + tl.arange(0, BN)
+    mask_hs = offs_hs < HS
+    mask = mask_m[:, None] & mask_hs[None, :]
+    block = tl.load(
+        block_ptr + offs_m[:, None] * stride_bm + offs_hs[None, :] * stride_bh,
+        mask=mask, other=0.0,
+    )
+    for c in tl.static_range(HC):
+        residual = tl.load(
+            residual_ptr + offs_m[:, None] * stride_rm
+            + (c * HS + offs_hs)[None, :] * stride_rk,
+            mask=mask, other=0.0,
+        )
+        gate_c = tl.sum(
+            tl.where(offs_hc[None, :] == c, weight_out, 0.0), axis=1
+        )
+        injection = _round_bf16(
+            block.to(tl.float32) * gate_c[:, None].to(tl.float32)
+        )
+        combined = _round_bf16(residual.to(tl.float32) + injection.to(tl.float32))
+        tl.store(
+            out_ptr + offs_m[:, None] * stride_om
+            + (c * HS + offs_hs)[None, :] * stride_ok,
+            combined, mask=mask,
+        )
+
+
+def hc_combine_small(
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    normed_residual: torch.Tensor,
+    inject_weight: torch.Tensor,
+    hc: int,
+    hs: int,
+) -> torch.Tensor:
+    """Deterministic fused combine gate + apply for any row count."""
+
+    m = block_output.shape[0]
+    n = inject_weight.shape[0]
+    if hc > 16 or n != hc:
+        raise ValueError("hc_combine_small only supports hc == N <= 16")
+    device = block_output.device
+    normed = normed_residual.detach().contiguous()
+    block = block_output.contiguous()
+    scratch = _GATE_SCRATCH.get(device.index)
+    rows_cap = max(m, HC_GEMM_THRESHOLD)
+    if scratch is None or scratch.shape[0] != _GATE_SPLITS or scratch.shape[1] < rows_cap:
+        if scratch is not None:
+            _GATE_SCRATCH_RETIRED.append(scratch)
+        scratch = torch.empty(
+            (_GATE_SPLITS, rows_cap, n), device=device, dtype=torch.float32
+        )
+        _GATE_SCRATCH[device.index] = scratch
+    _hc_gate_partial_kernel[(_GATE_SPLITS, triton.cdiv(m, _GATE_TILE_BM))](
+        normed, inject_weight.detach().contiguous(), scratch,
+        m, normed.shape[1], n,
+        normed.stride(0), normed.stride(1),
+        inject_weight.stride(0), inject_weight.stride(1),
+        scratch.stride(0), scratch.stride(1), scratch.stride(2),
+        SPLITS=_GATE_SPLITS, BM=_GATE_TILE_BM, BK=64, NP=16,
+        num_warps=4, num_stages=3,
+    )
+    out = torch.empty_like(residual)
+    _hc_combine_apply_kernel[
+        (triton.cdiv(m, _GATE_TILE_BM), triton.cdiv(hs, _COMBINE_BN))
+    ](
+        block, residual, scratch, out,
+        m, hs,
+        block.stride(0), block.stride(1),
+        residual.stride(0), residual.stride(1),
+        scratch.stride(0), scratch.stride(1), scratch.stride(2),
+        out.stride(0), out.stride(1),
+        SPLITS=_GATE_SPLITS, BM=_GATE_TILE_BM, BN=_COMBINE_BN, HC=hc,
+        num_warps=4, num_stages=3,
+    )
+    return out
+
+
+_MIX_TAIL_BM = 8
+_MIX_TAIL_BN = 512
+
+
+@triton.jit
+def _hc_mix_tail_kernel(
+    mix_ptr, norm_ptr, out_ptr,
+    M, HS,
+    stride_mm, stride_nm, stride_om,
+    HC: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_j = pid_n * BN + tl.arange(0, BN)
+    mask = (offs_m < M)[:, None] & (offs_j < HS)[None, :]
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for c in tl.static_range(HC):
+        offs = c * HS + offs_j
+        w = tl.load(
+            mix_ptr + offs_m[:, None] * stride_mm + offs[None, :],
+            mask=mask, other=0.0,
+        )
+        n = tl.load(
+            norm_ptr + offs_m[:, None] * stride_nm + offs[None, :],
+            mask=mask, other=0.0,
+        )
+        sig = _round_bf16(tl.sigmoid(w.to(tl.float32)))
+        prod = _round_bf16(sig.to(tl.float32) * n.to(tl.float32))
+        acc += prod.to(tl.float32)
+    out = _round_bf16(acc / HC)
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_om + offs_j[None, :], out, mask=mask
+    )
+
+
+def hc_mix_tail(
+    mix_weight: torch.Tensor, normed: torch.Tensor, hc: int, hs: int
+) -> torch.Tensor:
+    """Reproduce the eager mix tail (sigmoid -> mul -> mean) bitwise at any M."""
+
+    m = mix_weight.shape[0]
+    out = torch.empty((m, hs), device=mix_weight.device, dtype=torch.bfloat16)
+    if m == 0:
+        return out
+    mix = mix_weight.detach().contiguous()
+    norm = normed.detach().contiguous()
+    grid = (triton.cdiv(m, _MIX_TAIL_BM), triton.cdiv(hs, _MIX_TAIL_BN))
+    _hc_mix_tail_kernel[grid](
+        mix, norm, out,
+        m, hs,
+        mix.stride(0), norm.stride(0), out.stride(0),
+        HC=hc, BM=_MIX_TAIL_BM, BN=_MIX_TAIL_BN,
+        num_warps=4, num_stages=2,
+    )
+    return out
 
 
 def _self_check(compiled, n: int, k: int) -> None:
