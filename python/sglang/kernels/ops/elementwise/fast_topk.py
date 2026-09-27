@@ -19,9 +19,7 @@ _FAST_TOPK_SUPPORTED_K = (512, 2048)
 
 @cache_once
 def _jit_fast_topk_module(topk: int) -> Module:
-    """Compile and cache the JIT fast top-k module for a given k."""
-    # Checks on the compile key live here, not in `fast_topk`: `cache_once`
-    # keys on `topk`, so this runs once per specialisation.
+    """Compile one fast_topk specialization with canonical output ordering."""
     if topk not in _FAST_TOPK_SUPPORTED_K:
         raise RuntimeError(
             f"Unsupported topk {topk}. Supported: {_FAST_TOPK_SUPPORTED_K}"
@@ -47,7 +45,9 @@ def fast_topk(
     Row b selects the `topk` largest values in
     ``score[b, row_starts[b] : row_starts[b] + lengths[b]]`` and returns their
     indices relative to ``row_starts[b]``. Slots beyond ``lengths[b]`` are -1.
-    Output order within a row is unspecified (atomic collection order).
+    Output indices within a row are in ascending relative-index order. When
+    the cutoff score is tied, smaller relative indices win. Scores may be
+    finite or positive/negative infinity; NaN values are not supported.
 
     Parameters
     ----------
@@ -60,11 +60,14 @@ def fast_topk(
     -------
     CUDA int32 tensor [B, topk]
     """
+    if topk not in _FAST_TOPK_SUPPORTED_K:
+        raise RuntimeError(
+            f"Unsupported topk {topk}. Supported: {_FAST_TOPK_SUPPORTED_K}"
+        )
     batch = score.shape[0]
     if row_starts is None:
         row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
     indices = score.new_empty((batch, topk), dtype=torch.int32)
-
     module = _jit_fast_topk_module(topk)
     module.fast_topk(score, row_starts, indices, lengths)
     return indices
