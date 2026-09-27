@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.layers.hc_gemm import hc_gemm, prepare as _hc_gemm_prepare
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -189,9 +190,9 @@ class GatedResidual(HyperConnectionBase):
             hs: int,
         ) -> torch.Tensor:
             input_mix_weight = F.silu(
-                F.linear(hyper_input_normed, input_mix_weight_down) / hc
+                hc_gemm(hyper_input_normed, input_mix_weight_down) / hc
             )
-            input_mix_weight = F.linear(input_mix_weight, input_mix_weight_up)
+            input_mix_weight = hc_gemm(input_mix_weight, input_mix_weight_up)
             input_mix_weight = torch.sigmoid(input_mix_weight)
             input_mix_weight = input_mix_weight.unflatten(-1, (hc, hs))
             output = (
@@ -209,15 +210,23 @@ class GatedResidual(HyperConnectionBase):
         ) -> torch.Tensor:
             R = residual.unflatten(-1, (hc, hs))
             block_inject_weight_out = 2 * torch.sigmoid(
-                F.linear(normed_residual, block_inject_weight) / hc
+                hc_gemm(normed_residual, block_inject_weight) / hc
             )
             injection = block_output.unsqueeze(-2) * block_inject_weight_out.unsqueeze(
                 -1
             )
             return (R + injection).flatten(-2)
 
-        self._mix_compute = torch.compile(_mix_compute)
-        self._combine_compute = torch.compile(_combine_compute)
+        self._mix_compute = _mix_compute
+        self._combine_compute = _combine_compute
+        if self.input_mix_weight_down.weight.device.type == "cuda":
+            _hc_gemm_prepare(
+                self.input_mix_weight_down.weight.device,
+                [tuple(self.input_mix_weight_down.weight.shape),
+                 tuple(self.input_mix_weight_up.weight.shape)]
+                + ([tuple(self.block_inject_weight.weight.shape)]
+                   if hasattr(self, "block_inject_weight") else []),
+            )
 
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
@@ -233,48 +242,13 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
-        if (
-            self._jit_mix_ok
-            and hyper_input_normed.is_cuda
-            and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
-            and hyper_input_normed.shape[0] <= 24
-        ):
-            from sglang.kernels.ops.elementwise.hc_mix import (
-                hc_mix,
-                permute_pad_up_weight,
-            )
-
-            if self._mix_up_weight_padded is None:
-                self._mix_up_weight_padded = permute_pad_up_weight(
-                    self.input_mix_weight_up.weight, self.hc_count
-                )
-            mixed_input = hc_mix(
-                hyper_input_normed,
-                self.input_mix_weight_down.weight.data,
-                self._mix_up_weight_padded,
-                self.hc_count,
-                self.hidden_size,
-            ).to(self.params_dtype)
-        elif fused_hc_mix_supported(
+        mixed_input = self._mix_compute(
             hyper_input_normed,
             self.input_mix_weight_down.weight,
             self.input_mix_weight_up.weight,
-        ):
-            mixed_input = fused_hc_mix(
-                hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
-                self.hc_count,
-                self.hidden_size,
-            ).to(self.params_dtype)
-        else:
-            mixed_input = self._mix_compute(
-                hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
-                self.hc_count,
-                self.hidden_size,
-            ).to(self.params_dtype)
+            self.hc_count,
+            self.hidden_size,
+        ).to(self.params_dtype)
         return mixed_input, (hyper_input, hyper_input_normed)
 
     def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
@@ -283,38 +257,6 @@ class GatedResidual(HyperConnectionBase):
         assert block_output.shape[-1] == self.hidden_size
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
-
-        if (
-            self._jit_combine_ok
-            and block_output.is_cuda
-            and block_output.dtype in (torch.bfloat16, torch.float16)
-            and hyper_input.dtype == block_output.dtype
-            and hyper_input_normed.dtype == block_output.dtype
-            and self.block_inject_weight.weight.dtype == block_output.dtype
-        ):
-            if self._split_combine_ok and block_output.shape[0] <= 32:
-                from sglang.kernels.ops.elementwise.hc_combine import (
-                    hc_combine_split,
-                )
-
-                return hc_combine_split(
-                    block_output,
-                    hyper_input,
-                    hyper_input_normed,
-                    self.block_inject_weight.weight.data,
-                    self.hc_count,
-                    self.hidden_size,
-                )
-            from sglang.kernels.ops.elementwise.hc_combine import hc_combine
-
-            return hc_combine(
-                block_output,
-                hyper_input,
-                hyper_input_normed,
-                self.block_inject_weight.weight,
-                self.hc_count,
-                self.hidden_size,
-            )
 
         updated_residuals = self._combine_compute(
             block_output,
