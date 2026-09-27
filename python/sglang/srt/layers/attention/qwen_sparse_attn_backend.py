@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
     compressed_decode_view,
 )
+from sglang.srt.layers.attention.qsa.mtp_indices import compact_sparse_indices
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
@@ -168,7 +169,8 @@ class QSAMTPSharedSparseIndices:
         layer_id: int,
     ) -> torch.Tensor:
         """Frozen selection plus a tail of positions drafted since the capture;
-        tail slots past current_position hold -1, which downstream drops."""
+        tail slots past current_position hold -1. Return a compact valid prefix
+        because downstream KV packing uses valid counts as column bounds."""
         slot = self.layer_slots[int(layer_id)]
         rows = req_pool_indices.to(torch.long)
         out = self.indices[slot, rows]
@@ -178,7 +180,7 @@ class QSAMTPSharedSparseIndices:
         out[:, out.shape[1] - self.tail_width :] = torch.where(valid, tail, -1).to(
             out.dtype
         )
-        return out
+        return compact_sparse_indices(out)
 
 
 class QwenSparseAttnBackend(AttentionBackend):
