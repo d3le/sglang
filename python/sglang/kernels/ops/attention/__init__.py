@@ -116,7 +116,7 @@ def qwen38_qsa_sm121_varlen(
     ):
         raise ValueError(
             "unsupported SM121 QSA call: expected BF16 D=256, 12:1 GQA, "
-            "TP1 24Q/2KV or TP2 12Q/1KV, bs<=128, and selected KV<=2055"
+            "TP1 24Q/2KV or TP2 12Q/1KV, bs<=128, and selected KV<=2060"
         )
     return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.TRITON)(
         q,

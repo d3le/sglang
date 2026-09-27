@@ -12,7 +12,12 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_HEAD_TOPOLOGIES = frozenset({(12, 1), (24, 2)})
 # Largest batch qualified by the extended GB10 baseline sweep.
 _MAX_BATCH = 128
-_MAX_SELECTED_KV = 2055
+# Token budget 2048 + ratio - 1 tail + the MTP draft tail (steps + 1).  The
+# kernel loops over KV tiles and its scratch does not depend on the length;
+# 2055 (3 steps) was the captured envelope, and 2056-2100 match its accuracy
+# against an FP32 reference (tools/mtp/qsa_sm121_len_probe.py in the control
+# repo), so up to 8 draft steps are admitted.
+_MAX_SELECTED_KV = 2060
 _logged_fast_path = False
 
 
