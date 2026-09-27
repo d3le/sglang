@@ -1,29 +1,94 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
+import os
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
-_H20_CONFIGS = [
-    (32, (32, 8, 2)),
+# Diagnostic: pin one Triton (BLOCK_N, num_warps, num_stages) configuration for
+# every total_q so the prefill reduction order does not depend on the batch
+# shape.  The default per-shape table changes BLOCK_N at 128/256 queries
+# (64 -> 32), which makes the same row produce different values in a solo vs
+# batched prefill.
+_QSA_SPARSE_CANONICAL_CONFIG = os.environ.get(
+    "SGLANG_QSA_SPARSE_CANONICAL_CONFIG", ""
+).strip()
+
+
+def _read_diag_config() -> str:
+    if os.path.exists("/diag/qsa_sparse_config"):
+        try:
+            with open("/diag/qsa_sparse_config", encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
+# Canonical per-row Triton configuration for the prefill kernels.  A row's
+# value must not depend on how many queries happened to share its prefill
+# batch, so the configuration is picked from the row's own visible KV count
+# (the kernel's ``row_topk``) instead of the batch shape.  Rows are grouped by
+# that key and every group is launched with its own (BLOCK_N, num_warps,
+# num_stages); ``num_stages`` never changes values, so it stays a pure
+# performance knob.  The bucket configs are the validated device table tiers.
+_ROW_BUCKETS = (
     (64, (64, 8, 2)),
-    (1024, (32, 4, 2)),
-    (float("inf"), (16, 1, 2)),
-]
-_L20_CONFIGS = [
-    (32, (32, 8, 2)),
-    (64, (64, 8, 2)),
-    (128, (64, 4, 2)),
     (512, (32, 4, 2)),
-    (float("inf"), (16, 1, 2)),
-]
+    (None, (16, 1, 2)),
+)
+_ROW_BUCKET_LIMITS = tuple(limit for limit, _ in _ROW_BUCKETS if limit is not None)
 
 
-def _get_best_config(total_q: int):
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
-    return next(cfg for limit, cfg in table if total_q <= limit)
+def _row_config(visible: int, topk: int):
+    key = min(visible, topk)
+    for limit, config in _ROW_BUCKETS:
+        if limit is None or key <= limit:
+            return config
+    return _ROW_BUCKETS[-1][1]
+
+
+def _pinned_row_config():
+    pinned = _read_diag_config() or _QSA_SPARSE_CANONICAL_CONFIG
+    if not pinned:
+        return None
+    block_n, warps, stages = (int(value) for value in pinned.split(","))
+    return (block_n, warps, stages)
+
+
+def _split_row_ranges(starts, ends, visible_bases, topk, tags=None):
+    """Split request row ranges on the per-row configuration boundaries."""
+    ranges = []
+    for index, (start, end, base) in enumerate(zip(starts, ends, visible_bases)):
+        cuts = [start]
+        for limit in _ROW_BUCKET_LIMITS:
+            if limit >= topk:
+                continue
+            cut = start + (limit - base) + 1
+            if start < cut < end:
+                cuts.append(cut)
+        cuts.append(end)
+        for begin, stop in zip(cuts, cuts[1:]):
+            if stop <= begin:
+                continue
+            visible = base + (begin - start)
+            tag = None if tags is None else tags[index]
+            ranges.append((_row_config(visible, topk), begin, stop, visible, tag))
+    return ranges
+
+
+def _group_row_ranges(ranges):
+    order = []
+    grouped = {}
+    for entry in ranges:
+        config = entry[0]
+        if config not in grouped:
+            grouped[config] = []
+            order.append(config)
+        grouped[config].append(entry)
+    return [(config, grouped[config]) for config in order]
 
 
 @triton.jit
@@ -33,7 +98,10 @@ def _sparse_gqa_prefill(
     v,
     out,
     indices,
-    cu_seqlens,
+    seq_starts,
+    seq_ends,
+    kv_starts,
+    visible_bases,
     scale,
     topk,
     sq_m: tl.constexpr,
@@ -60,14 +128,18 @@ def _sparse_gqa_prefill(
     batch_group = tl.program_id(1)
     group = batch_group % NUM_KV_HEADS
     batch = batch_group // NUM_KV_HEADS
-    seq_start = tl.load(cu_seqlens + batch).to(tl.int64)
-    seq_end = tl.load(cu_seqlens + batch + 1).to(tl.int64)
+    seq_start = tl.load(seq_starts + batch).to(tl.int64)
+    seq_end = tl.load(seq_ends + batch).to(tl.int64)
     query_relative = tl.program_id(0).to(tl.int64)
     query = seq_start + query_relative
     if query >= seq_end:
         return
 
-    row_topk = tl.minimum(topk, query_relative + 1)
+    # The KV base is the owning request's start row: the row's token indices
+    # are request-relative even when the launch only covers a row sub-range.
+    kv_start = tl.load(kv_starts + batch).to(tl.int64)
+    visible = tl.load(visible_bases + batch).to(tl.int64) + query_relative
+    row_topk = tl.minimum(topk, visible)
     row_limit = tl.minimum(topk, ((row_topk + BLOCK_N - 1) // BLOCK_N) * BLOCK_N)
     offs_h = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
@@ -81,8 +153,8 @@ def _sparse_gqa_prefill(
         other=0.0,
     )
     q_values = (q_values * scale * 1.4426950408).to(q_values.dtype)
-    k_base = k + seq_start * sk_n + group * sk_h
-    v_base = v + seq_start * sv_n + group * sv_h
+    k_base = k + kv_start * sk_n + group * sk_h
+    v_base = v + kv_start * sv_n + group * sv_h
     idx_row = indices + query * si_m + group * si_g
     max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
     normalizer = tl.zeros([BLOCK_M], tl.float32)
@@ -127,40 +199,70 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    topk = indices.shape[-1]
     out = torch.empty_like(q)
-    _sparse_gqa_prefill[(max_seqlen_k, (cu_seqlens.shape[0] - 1) * num_kv_heads)](
-        q,
-        k,
-        v,
-        out,
-        indices,
-        cu_seqlens,
-        scale,
-        indices.shape[-1],
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        indices.stride(0),
-        indices.stride(1) if indices.ndim == 3 else 0,
-        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
-        NUM_KV_HEADS=num_kv_heads,
-        GROUP_SIZE=group_size,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        HEAD_DIM=head_dim,
-        num_warps=warps,
-        num_stages=stages,
-    )
+    starts = [int(value) for value in cu_seqlens[:-1].tolist()]
+    ends = [int(value) for value in cu_seqlens[1:].tolist()]
+    # No cached prefix in this path: the first row of a request sees one token.
+    visible_bases = [1] * len(starts)
+    pinned = _pinned_row_config()
+    if pinned is None:
+        ranges = _split_row_ranges(starts, ends, visible_bases, topk, tags=starts)
+    else:
+        ranges = [
+            (pinned, begin, stop, visible, start)
+            for begin, stop, visible, start in zip(starts, ends, visible_bases, starts)
+            if stop > begin
+        ]
+    for (block_n, warps, stages), group in _group_row_ranges(ranges):
+        range_starts = torch.tensor(
+            [entry[1] for entry in group], dtype=torch.int32, device=q.device
+        )
+        range_ends = torch.tensor(
+            [entry[2] for entry in group], dtype=torch.int32, device=q.device
+        )
+        range_k = torch.tensor(
+            [entry[4] for entry in group], dtype=torch.int32, device=q.device
+        )
+        range_visible = torch.tensor(
+            [entry[3] for entry in group], dtype=torch.int32, device=q.device
+        )
+        max_rows = max(entry[2] - entry[1] for entry in group)
+        _sparse_gqa_prefill[(max_rows, len(group) * num_kv_heads)](
+            q,
+            k,
+            v,
+            out,
+            indices,
+            range_starts,
+            range_ends,
+            range_k,
+            range_visible,
+            scale,
+            topk,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            indices.stride(0),
+            indices.stride(1) if indices.ndim == 3 else 0,
+            indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+            NUM_KV_HEADS=num_kv_heads,
+            GROUP_SIZE=group_size,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            HEAD_DIM=head_dim,
+            num_warps=warps,
+            num_stages=stages,
+        )
     return out
 
 
@@ -172,8 +274,9 @@ def _sparse_gqa_chunk_prefill(
     out,
     indices,
     cu_q,
+    cu_q_end,
     cu_k,
-    kv_lens,
+    visible_bases,
     scale,
     topk,
     sq_m: tl.constexpr,
@@ -202,13 +305,12 @@ def _sparse_gqa_chunk_prefill(
     group = batch_group % NUM_KV_HEADS
     batch = batch_group // NUM_KV_HEADS
     q_start = tl.load(cu_q + batch)
-    q_end = tl.load(cu_q + batch + 1)
+    q_end = tl.load(cu_q_end + batch)
     query = (q_start + query_relative).to(tl.int64)
     if query >= q_end:
         return
     k_start = tl.load(cu_k + batch).to(tl.int64)
-    kv_len = tl.load(kv_lens + batch).to(tl.int64)
-    visible = query_relative + kv_len - (q_end - q_start) + 1
+    visible = tl.load(visible_bases + batch).to(tl.int64) + query_relative
     row_topk = tl.minimum(topk, visible)
     row_limit = tl.minimum(topk, ((row_topk + BLOCK_N - 1) // BLOCK_N) * BLOCK_N)
     offs_h = tl.arange(0, BLOCK_M)
@@ -275,44 +377,75 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    topk = indices.shape[-1]
     out = torch.empty_like(q)
-    _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
-        q,
-        k,
-        v,
-        out,
-        indices,
-        cu_q,
-        cu_k,
-        kv_lens,
-        scale,
-        indices.shape[-1],
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        indices.stride(0),
-        indices.stride(1) if indices.ndim == 3 else 0,
-        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
-        NUM_KV_HEADS=num_kv_heads,
-        GROUP_SIZE=group_size,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        HEAD_DIM=head_dim,
-        num_warps=warps,
-        num_stages=stages,
-    )
+    q_starts = [int(value) for value in cu_q[:-1].tolist()]
+    q_ends = [int(value) for value in cu_q[1:].tolist()]
+    k_starts = [int(value) for value in cu_k[:-1].tolist()]
+    # Visible KV count of each request's first row (its cached prefix + one).
+    visible_bases = [
+        int(kv_lens[index]) - (q_ends[index] - q_starts[index]) + 1
+        for index in range(len(q_starts))
+    ]
+    pinned = _pinned_row_config()
+    if pinned is None:
+        ranges = _split_row_ranges(q_starts, q_ends, visible_bases, topk, tags=k_starts)
+    else:
+        ranges = [
+            (pinned, q_starts[index], q_ends[index], visible_bases[index], k_starts[index])
+            for index in range(len(q_starts))
+            if q_ends[index] > q_starts[index]
+        ]
+    for (block_n, warps, stages), group in _group_row_ranges(ranges):
+        range_starts = torch.tensor(
+            [entry[1] for entry in group], dtype=torch.int32, device=q.device
+        )
+        range_ends = torch.tensor(
+            [entry[2] for entry in group], dtype=torch.int32, device=q.device
+        )
+        range_k = torch.tensor(
+            [entry[4] for entry in group], dtype=torch.int32, device=q.device
+        )
+        range_visible = torch.tensor(
+            [entry[3] for entry in group], dtype=torch.int32, device=q.device
+        )
+        max_rows = max(entry[2] - entry[1] for entry in group)
+        _sparse_gqa_chunk_prefill[(max_rows, len(group) * num_kv_heads)](
+            q,
+            k,
+            v,
+            out,
+            indices,
+            range_starts,
+            range_ends,
+            range_k,
+            range_visible,
+            scale,
+            topk,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            indices.stride(0),
+            indices.stride(1) if indices.ndim == 3 else 0,
+            indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+            NUM_KV_HEADS=num_kv_heads,
+            GROUP_SIZE=group_size,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            HEAD_DIM=head_dim,
+            num_warps=warps,
+            num_stages=stages,
+        )
     return out
 
 
