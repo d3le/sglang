@@ -11,7 +11,7 @@ from sglang.srt.layers.hc_mix_triton import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 HC_COUNT = 4
 HIDDEN_SIZE = 2560
@@ -75,8 +75,73 @@ def test_fused_hc_mix_no_less_accurate_than_eager():
     assert fused_err <= eager_err * 1.5 + 1e-6
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", range(1, _FUSED_MIX_MAX_ROWS + 1))
+def test_fused_hc_mix_is_bitwise_stable_in_eager_and_graph(dtype, num_tokens):
+    """The normal kernel must not depend on CTA order or graph replay state."""
+    x, w_down, w_up = _make_inputs(num_tokens, dtype)
+    call = lambda: fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    eager = [call().clone() for _ in range(100)]
+    torch.cuda.synchronize()
+    assert all(torch.equal(eager[0], value) for value in eager[1:])
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = call()
+    graph_outputs = []
+    for _ in range(100):
+        graph.replay()
+        graph_outputs.append(graph_out.clone())
+    torch.cuda.synchronize()
+    assert all(torch.equal(graph_outputs[0], value) for value in graph_outputs[1:])
+    assert torch.equal(graph_outputs[0], eager[0])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_hc_mix_has_no_stale_workspace(dtype):
+    """Changing packed row counts must not expose a previous invocation."""
+    inputs = {rows: _make_inputs(rows, dtype) for rows in (1, 8, 16)}
+    clean = fused_hc_mix(*inputs[8], HC_COUNT, HIDDEN_SIZE).clone()
+    fused_hc_mix(*inputs[16], HC_COUNT, HIDDEN_SIZE)
+    fused_hc_mix(*inputs[1], HC_COUNT, HIDDEN_SIZE)
+    after = fused_hc_mix(*inputs[8], HC_COUNT, HIDDEN_SIZE).clone()
+    torch.cuda.synchronize()
+    assert torch.equal(clean, after)
+
+
+def test_fused_hc_mix_supports_four_concurrent_streams():
+    """Separate requests must not share barrier state or deadlock."""
+    x, w_down, w_up = _make_inputs(_FUSED_MIX_MAX_ROWS, torch.bfloat16)
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream() for _ in range(4)]
+    all_outputs = []
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            stream_outputs = []
+            for _ in range(10):
+                stream_outputs.append(
+                    fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+                )
+            all_outputs.append(stream_outputs)
+    for stream in streams:
+        stream.synchronize()
+    torch.cuda.synchronize()
+    reference = all_outputs[0][0]
+    assert all(
+        torch.equal(reference, value)
+        for stream_outputs in all_outputs
+        for value in stream_outputs
+    )
+
+
 def test_fused_hc_mix_gate_rejects_prefill_rows():
     x, w_down, w_up = _make_inputs(_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16)
+    assert not fused_hc_mix_supported(x, w_down, w_up)
+
+
+@pytest.mark.parametrize("num_tokens", [17, 32, 128])
+def test_fused_hc_mix_leaves_large_batches_on_fallback(num_tokens):
+    x, w_down, w_up = _make_inputs(num_tokens, torch.bfloat16)
     assert not fused_hc_mix_supported(x, w_down, w_up)
 
 
