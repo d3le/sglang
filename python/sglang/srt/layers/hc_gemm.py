@@ -23,9 +23,34 @@ HC_GEMM_THRESHOLD = 256
 _SMALL_TILE = (16, 32, 64)
 # Small-M shapes measured better with narrower tiles on GB10 (probe_smallm):
 _SMALL_TILES = {
-    (320, 10240): (8, 16, 64),
+    (320, 10240): (8, 16, 512),
     (10240, 320): (8, 128, 64),
     (4, 10240): (8, 16, 64),
+    # bf16_det decode shapes (mtp-nv-188): a deeper K pipeline reaches 227-250
+    # GB/s; every tile was bitwise equal to the old (16, 32, 64) at M=4/16.
+    (96, 2560): (8, 16, 256),
+    (512, 2560): (8, 32, 128),
+    (640, 2560): (8, 32, 256),
+    (1280, 2560): (8, 32, 256),
+    (2560, 2560): (8, 16, 512),
+    (2560, 6144): (8, 16, 256),
+    (10240, 2560): (8, 16, 512),
+    (13312, 2560): (8, 16, 512),
+}
+# (num_warps, num_stages) per shape; the default stays 4/3.  The decode down
+# GEMM (narrow N, long K) needs BK=512 with 4 pipeline stages to reach ~217 GB/s
+# on GB10 (mtp-nv-168: 63.5 -> 41.5-44 us cold, bitwise vs the old tile at
+# M=1/4/16/255/256/257/8192).
+_SMALL_TILE_WS = {
+    (320, 10240): (4, 4),
+    (96, 2560): (4, 4),
+    (512, 2560): (4, 6),
+    (640, 2560): (4, 4),
+    (1280, 2560): (4, 4),
+    (2560, 2560): (4, 3),
+    (2560, 6144): (4, 6),
+    (10240, 2560): (4, 4),
+    (13312, 2560): (4, 4),
 }
 _CUTE_TILES = {
     # hyperconnection
@@ -89,6 +114,7 @@ def _launch_small(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> N
     m, k = x.shape
     n = weight.shape[0]
     bm, bn, bk = _SMALL_TILES.get((n, k), _SMALL_TILE)
+    warps, stages = _SMALL_TILE_WS.get((n, k), (4, 3))
     grid = (triton.cdiv(m, bm), triton.cdiv(n, bn))
     _hc_gemm_small_kernel[grid](
         x, weight, out,
@@ -97,7 +123,7 @@ def _launch_small(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> N
         weight.stride(0), weight.stride(1),
         out.stride(0), out.stride(1),
         BM=bm, BN=bn, BK=bk,
-        num_warps=4, num_stages=3,
+        num_warps=warps, num_stages=stages,
     )
 
 
