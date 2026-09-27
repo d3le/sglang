@@ -530,8 +530,10 @@ def _launch_fused_gate_sigmoid_mul(
         ),
     }
 
-    if num_tokens >= 1024:
-        config["num_warps"] = min(config["num_warps"], 8)
+    # num_warps sets the reduction tree of the per-row gate logit (tl.sum over
+    # hidden_dim), so it must not depend on num_tokens: a token would otherwise
+    # get a different gate value depending on how many rows share its forward
+    # (chunked prefill / partial prefix hits vs one large chunk).
 
     use_pdl = is_arch_support_pdl()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
