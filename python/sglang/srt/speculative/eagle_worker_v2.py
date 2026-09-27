@@ -458,8 +458,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
-                head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
+                hot_head = _slice_quantized_lm_head(target_lm_head, self.hot_token_id)
+                if hot_head is not None:
+                    # Quantized target head (e.g. ModelOpt FP8): the draft gets a
+                    # row-sliced copy of the whole module, so the quant method,
+                    # scales and layout stay consistent with the weight.
+                    self.draft_runner.model.set_embed_and_head(embed, None)
+                    self.draft_runner.model.set_lm_head_from_target(hot_head)
+                    return
+                head = head.clone()
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
@@ -1874,3 +1882,51 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         )
         return success, message
+
+def _slice_quantized_lm_head(lm_head, hot_token_id: torch.Tensor):
+    """Row-slice a quantized lm_head module to the hot vocabulary, or None.
+
+    ModelOpt FP8 keeps the weight as a transposed [hidden, vocab] view and the
+    scale either per tensor (one element) or per output row ([vocab, 1]).  The
+    copy shares everything else (input scale, quant method) with the target.
+    """
+    if lm_head is None or getattr(lm_head, "weight_scale", None) is None:
+        return None
+    import copy
+
+    weight = lm_head.weight
+    vocab = int(getattr(lm_head, "logical_widths", [weight.shape[0]])[0])
+    ids = hot_token_id.to(device=weight.device, dtype=torch.long)
+    if ids.numel() % 16:
+        # cuBLASLt FP8 GEMMs reject an output width that is not a multiple of
+        # 16 for every M, so an unaligned head would only fail on the first
+        # prefill that takes that path.  Refuse it at startup instead.
+        raise ValueError(
+            f"--speculative-token-map has {ids.numel()} tokens; a quantized "
+            "lm_head needs a multiple of 16 (pad the map)"
+        )
+    if weight.dim() == 2 and weight.shape[1] == vocab and weight.shape[0] != vocab:
+        # Transposed view: slice the vocab rows of the underlying matrix and
+        # transpose back so the stride pattern matches the original.
+        new_weight = weight.t().index_select(0, ids).t()
+    elif weight.dim() == 2 and weight.shape[0] == vocab:
+        new_weight = weight.index_select(0, ids)
+    else:
+        return None
+    scale = lm_head.weight_scale
+    if scale.numel() > 1:
+        if scale.shape[0] != vocab:
+            return None
+        scale = scale.index_select(0, ids)
+    hot = copy.copy(lm_head)
+    hot._parameters = dict(lm_head._parameters)
+    hot._buffers = dict(lm_head._buffers)
+    hot._modules = dict(lm_head._modules)
+    hot.weight = torch.nn.Parameter(new_weight, requires_grad=False)
+    hot.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+    if hasattr(lm_head, "logical_widths"):
+        hot.logical_widths = [int(ids.numel())]
+    for name in ("num_embeddings", "num_embeddings_per_partition", "org_vocab_size"):
+        if hasattr(lm_head, name):
+            setattr(hot, name, int(ids.numel()))
+    return hot
