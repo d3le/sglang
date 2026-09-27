@@ -26,7 +26,7 @@ _SMALL_TILES = {
     (320, 10240): (8, 16, 512),
     (10240, 320): (8, 128, 64),
     (4, 10240): (8, 16, 64),
-    # bf16_det decode shapes (mtp-nv-188): a deeper K pipeline reaches 227-250
+    # Decode shapes of the deterministic bf16 linears: a deeper K pipeline reaches 227-250
     # GB/s; every tile was bitwise equal to the old (16, 32, 64) at M=4/16.
     (96, 2560): (8, 16, 256),
     (512, 2560): (8, 32, 128),
@@ -39,7 +39,7 @@ _SMALL_TILES = {
 }
 # (num_warps, num_stages) per shape; the default stays 4/3.  The decode down
 # GEMM (narrow N, long K) needs BK=512 with 4 pipeline stages to reach ~217 GB/s
-# on GB10 (mtp-nv-168: 63.5 -> 41.5-44 us cold, bitwise vs the old tile at
+# on GB10 (63.5 -> 41.5-44 us cold, bitwise vs the old tile at
 # M=1/4/16/255/256/257/8192).
 _SMALL_TILE_WS = {
     (320, 10240): (4, 4),

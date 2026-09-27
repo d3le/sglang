@@ -244,30 +244,18 @@ class GatedResidual(HyperConnectionBase):
             hc: int,
             hs: int,
         ) -> torch.Tensor:
-            if not os.path.exists("/diag/legacy_combine"):
-                # Fused deterministic gate + apply for every row count: the
-                # split-K order is fixed, so the result is M-independent.
-                return hc_combine_small(
-                    block_output,
-                    residual,
-                    normed_residual,
-                    block_inject_weight,
-                    hc,
-                    hs,
-                )
-            block_inject_weight_out = 2 * torch.sigmoid(
-                hc_gemm(normed_residual, block_inject_weight) / hc
-            )
-            if block_inject_weight_out.shape[0] > fusion_min_rows:
-                return _combine_tail(
-                    block_output, residual, block_inject_weight_out, hc, hs
-                )
-            return _combine_tail_eager(
-                block_output, residual, block_inject_weight_out, hc, hs
+            # Fused deterministic gate + apply for every row count: the
+            # split-K order is fixed, so the result is M-independent.
+            return hc_combine_small(
+                block_output,
+                residual,
+                normed_residual,
+                block_inject_weight,
+                hc,
+                hs,
             )
 
         _mix_tail_eager = _mix_tail
-        _combine_tail_eager = _combine_tail
         _mix_tail = torch.compile(_mix_tail)
         _combine_tail = torch.compile(_combine_tail)
         self._mix_tail = _mix_tail

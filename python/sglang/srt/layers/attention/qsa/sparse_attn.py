@@ -17,16 +17,6 @@ _QSA_SPARSE_CANONICAL_CONFIG = os.environ.get(
 ).strip()
 
 
-def _read_diag_config() -> str:
-    if os.path.exists("/diag/qsa_sparse_config"):
-        try:
-            with open("/diag/qsa_sparse_config", encoding="utf-8") as handle:
-                return handle.read().strip()
-        except OSError:
-            return ""
-    return ""
-
-
 # Canonical per-row Triton configuration for the prefill kernels.  A row's
 # value must not depend on how many queries happened to share its prefill
 # batch, so the configuration is picked from the row's own visible KV count
@@ -51,7 +41,7 @@ def _row_config(visible: int, topk: int):
 
 
 def _pinned_row_config():
-    pinned = _read_diag_config() or _QSA_SPARSE_CANONICAL_CONFIG
+    pinned = _QSA_SPARSE_CANONICAL_CONFIG
     if not pinned:
         return None
     block_n, warps, stages = (int(value) for value in pinned.split(","))
