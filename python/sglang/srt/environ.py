@@ -1327,6 +1327,11 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Batch- and chunk-invariant dense GEMM routing (layers/deterministic_dense.py)
+    SGLANG_DETERMINISTIC_BF16_LINEAR = EnvBool(False)
+    SGLANG_FP8_POSITIONAL_PREFILL = EnvBool(False)
+    SGLANG_FP8_POSITIONAL_MIN_POS = EnvInt(256)
+    SGLANG_FP8_POSITIONAL_PAD_ROWS = EnvInt(64)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)

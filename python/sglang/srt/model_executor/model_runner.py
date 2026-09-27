@@ -72,7 +72,7 @@ from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
-from sglang.srt.layers import deep_gemm_wrapper, model_parallel
+from sglang.srt.layers import deep_gemm_wrapper, deterministic_dense, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
@@ -654,6 +654,7 @@ class ModelRunner:
             )
 
     def initialize(self):
+        deterministic_dense.install()
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
         self.maybe_init_expert_location_metadata()
@@ -1683,7 +1684,10 @@ class ModelRunner:
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
         )
-        with device_timer_ctx(self.device_timer, "split_prefill"):
+        with (
+            device_timer_ctx(self.device_timer, "split_prefill"),
+            deterministic_dense.forward_context(forward_batch),
+        ):
             ret = self.model.forward_split_prefill(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -1735,6 +1739,7 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            deterministic_dense.forward_context(forward_batch),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
