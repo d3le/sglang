@@ -949,6 +949,11 @@ class ReqKvInfo:
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
 
+    # QSA compressed pages matched for this request (staged at match time,
+    # consumed by the request pool's aux alloc on the next allocation).
+    qsa_shared_pages: Optional[torch.Tensor] = None
+    qsa_shared_tokens: int = 0
+
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
         # prefix and above the eviction shield, page-aligned upward.

@@ -29,10 +29,11 @@ def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
 class QSATokenToKVPool(HybridLinearKVPool):
     """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
 
-    # Full-KV pages are a multiple of the compress ratio, so no group straddles pages;
-    # ``compressed_slot = full_slot // ratio`` needs no ownership bookkeeping;
-    # lifecycle rides the full-KV allocator and radix tree.
-    # Full slot 0 is the reserved padding slot; compressed slot 0 is the inert dump.
+    # The compressed page space is independent of the full-KV slot space; the
+    # logical mapping owns pages per radix node / request tail (see
+    # ``qsa_compressed_cache``).  ``qsa_compressed_page_size`` groups occupy one
+    # page, so a compression group never straddles two pages.
+    # Full slot 0 is the reserved padding slot; compressed page 0 is the inert dump.
     index_state_dtype = torch.bfloat16
 
     @classmethod
@@ -118,8 +119,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_token_topk = int(qsa_token_topk)
         self.qsa_block_topk = self.qsa_token_topk // self.qsa_compress_ratio
         state_size = size + page_size
-        # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
-        # seen by the scoring kernels is one full-KV page's worth of groups.
+        # The "page" seen by the scoring kernels is one tree page's worth of
+        # groups; the page id itself comes from the logical page table.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
         # Pre-compression index-K state is a per-request ring, not a per-token cache:

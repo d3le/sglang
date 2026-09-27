@@ -4,6 +4,7 @@ Architectures: Qwen4ExpForConditionalGeneration.
 """
 
 import logging
+import os
 from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -79,6 +80,16 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
 
     profile = parse_qsa_profile(hf_config)
     if profile is not None:
+        if (
+            os.environ.get("SGLANG_QSA_LOGICAL_COMPRESSED") == "1"
+            and cfg.disaggregation_mode != "null"
+        ):
+            raise NotImplementedError(
+                "SGLANG_QSA_LOGICAL_COMPRESSED stage 2 owns the compressed "
+                "pages on the radix nodes; disaggregation still transfers "
+                "them as full-page images and must be ported to the page "
+                "lists before PD can run with this mapping"
+            )
         # Compressed slot = full_slot // ratio; all backends need page-aligned pages.
         # mamba_radix_cache_strategy resolves later, so do not gate on it.
         overrides["page_size"] = 64

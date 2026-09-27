@@ -430,6 +430,7 @@ def alloc_for_extend(
         batch.req_to_token_pool.alloc_aux_to_lengths(
             req_pool_indices_cpu=req_pool_indices_cpu,
             target_seq_lens_cpu=batch.seq_lens_cpu,
+            reqs=batch.reqs,
         )
     except Exception:
         batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
@@ -638,6 +639,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         batch.req_to_token_pool.alloc_aux_to_lengths(
             req_pool_indices_cpu=batch.req_pool_indices_cpu,
             target_seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+            reqs=batch.reqs,
         )
     except Exception:
         batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
@@ -772,6 +774,12 @@ def alloc_for_spec_decode(
             out_cache_loc,
             len(reqs),
         )
+
+    req_to_token_pool.alloc_aux_to_lengths(
+        req_pool_indices_cpu=req_pool_indices.to("cpu"),
+        target_seq_lens_cpu=nxt_kv_lens_cpu,
+        reqs=reqs,
+    )
 
     nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
     for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):

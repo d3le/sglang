@@ -381,6 +381,9 @@ class ReqToTokenPool:
     def schedulable_token_capacity(self, physical_capacity: int) -> int:
         if self._aux_cache is None:
             return physical_capacity
+        hook = getattr(self._aux_cache, "schedulable_token_capacity", None)
+        if hook is not None:
+            return hook(physical_capacity)
         return self._aux_cache.dense_capacity
 
     def alloc_aux_to_lengths(
@@ -388,12 +391,20 @@ class ReqToTokenPool:
         *,
         req_pool_indices_cpu: torch.Tensor,
         target_seq_lens_cpu: torch.Tensor,
+        reqs: Any = None,
     ) -> None:
         if self._aux_cache is not None:
-            self._aux_cache.alloc_to_lengths(
-                req_pool_indices_cpu=req_pool_indices_cpu,
-                target_seq_lens_cpu=target_seq_lens_cpu,
-            )
+            if reqs is not None and getattr(self._aux_cache, "wants_reqs", False):
+                self._aux_cache.alloc_to_lengths(
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                    target_seq_lens_cpu=target_seq_lens_cpu,
+                    reqs=reqs,
+                )
+            else:
+                self._aux_cache.alloc_to_lengths(
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                    target_seq_lens_cpu=target_seq_lens_cpu,
+                )
 
 
 class MambaPool:

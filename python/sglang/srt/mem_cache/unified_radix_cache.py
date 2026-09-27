@@ -408,6 +408,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if ComponentType.QSA_CP in self.tree_components:
+            raise NotImplementedError(
+                "QSA compressed pages have no host tier; the logical "
+                "compressed mapping does not support HiCache yet"
+            )
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
@@ -683,6 +688,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ComponentType.SWA: params.swa_num_tokens,
             ComponentType.MAMBA: params.mamba_num,
             ComponentType.C128: 0,
+            ComponentType.QSA_CP: 0,
         }
 
     def _component_available_size(self, component_type: ComponentType) -> int:

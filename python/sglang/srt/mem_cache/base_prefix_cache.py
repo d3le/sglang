@@ -82,6 +82,11 @@ class InsertParams:
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
 
+    # QSA logical compressed pages: the request row whose tail the insert
+    # donates, and the value-path version stamped onto the new nodes.
+    qsa_row: Optional[int] = None
+    qsa_value_path_version: int = 0
+
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
 

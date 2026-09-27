@@ -146,6 +146,20 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     return _create_unified_radix_cache(ctx, server_args, params)
 
 
+def _qsa_logical_compressed(params: CacheInitParams) -> bool:
+    """Whether this cache should own the QSA compressed pages by node."""
+
+    from sglang.srt.mem_cache.qsa_compressed_cache import logical_compressed_enabled
+
+    if not logical_compressed_enabled():
+        return False
+    try:
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+    except Exception:
+        return False
+    return int(getattr(kvcache, "qsa_num_request_slots", 0) or 0) > 0
+
+
 def _create_unified_radix_cache(
     ctx: TreeCacheBuildContext,
     server_args: ServerArgs,
@@ -176,6 +190,27 @@ def _create_unified_radix_cache(
         params.component_registry_override = {
             **(params.component_registry_override or {}),
             ComponentType.C128: C128SidecarComponent,
+        }
+
+    if _qsa_logical_compressed(params):
+        if (
+            ctx.enable_hierarchical_cache
+            or get_memory().enable_unified_cache_external_linker
+            or params.enable_session_radix_cache
+        ):
+            raise NotImplementedError(
+                "QSA logical compressed radix sharing owns its pages outside "
+                "the KV pools; HiCache, the external linker and session radix "
+                "caches are not supported yet"
+            )
+        from sglang.srt.mem_cache.unified_cache.components.qsa_cp import (
+            QSACompressedComponent,
+        )
+
+        tree_components.append(ComponentType.QSA_CP)
+        params.component_registry_override = {
+            **(params.component_registry_override or {}),
+            ComponentType.QSA_CP: QSACompressedComponent,
         }
 
     params.tree_components = tuple(tree_components)

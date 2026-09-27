@@ -67,6 +67,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_ratio: int
     block_topk: int
     req_pool_indices: Optional[torch.Tensor] = None
+    # Logical compressed page table (one row per sequence/query row) for the
+    # decoupled mapping; None keeps the physical ``full_slot // ratio`` view.
+    compressed_page_table: Optional[torch.Tensor] = None
     # Parallel per-group arrays for the groups compressed this forward:
     # slot, sequence-local group-end position, and owning metadata row.
     # The first member's token row in this forward's packed tensors is extend only,
@@ -131,18 +134,31 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
         sequence_lengths_list = sequence_lengths.tolist()
+        logical_table = self.compressed_page_table
+        compressed_page_size = int(pool.qsa_compressed_page_size)
         for sequence_id in range(len(sequence_lengths_list)):
             complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
             if complete_blocks == 0:
                 continue
-            # compressed slot = first raw slot // ratio; the allocator is page-aligned,
-            # so each group is contiguous in one page (see QSATokenToKVPool).
-            compressed_locs = (
-                self.token_slot_table[
-                    sequence_id, : complete_blocks * ratio : ratio
-                ].long()
-                // ratio
-            )
+            if logical_table is not None:
+                groups = torch.arange(
+                    complete_blocks, device=logical_table.device, dtype=torch.long
+                )
+                pages = logical_table[sequence_id].long().index_select(
+                    0, groups // compressed_page_size
+                )
+                compressed_locs = pages * compressed_page_size + (
+                    groups % compressed_page_size
+                )
+            else:
+                # compressed slot = first raw slot // ratio; the allocator is page-aligned,
+                # so each group is contiguous in one page (see QSATokenToKVPool).
+                compressed_locs = (
+                    self.token_slot_table[
+                        sequence_id, : complete_blocks * ratio : ratio
+                    ].long()
+                    // ratio
+                )
             parts.append(compressed_buffer.index_select(0, compressed_locs))
         compressed_keys = (
             torch.cat(parts, dim=0)

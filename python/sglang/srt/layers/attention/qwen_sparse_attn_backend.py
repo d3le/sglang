@@ -7,6 +7,7 @@ linear-attention layers continue to use GDN.
 from __future__ import annotations
 
 import logging
+import os
 import math
 from copy import copy
 from functools import lru_cache
@@ -22,6 +23,11 @@ from sglang.srt.layers.attention.qsa.config import (
     parse_qsa_profile,
 )
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
+from sglang.srt.mem_cache.qsa_compressed_cache import (
+    attach_qsa_compressed_cache,
+    get_qsa_compressed_page_cache,
+    logical_compressed_enabled,
+)
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_group_ring_slots,
@@ -39,6 +45,14 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
+
+# Diagnostic: while this file exists the per-replay logical write-tail audit is
+# skipped (same-boot attribution of its cost).  Unset in production.
+_ASSERT_DISABLE_FILE = os.environ.get("SGLANG_QSA_CP_ASSERT_DISABLE_FILE")
+# Diagnostic: while this file exists the logical decode page-table width is
+# taken from a device max (the pre-fix behaviour, one host sync per verify).
+# Same-boot attribution knob; unset in production.
+_SYNC_WIDTH_FILE = os.environ.get("SGLANG_QSA_CP_SYNC_WIDTH_FILE")
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
@@ -192,6 +206,23 @@ class QwenSparseAttnBackend(AttentionBackend):
         req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
+        self.compressed_page_cache = None
+        self.logical_compressed = logical_compressed_enabled()
+        self.is_draft_worker = bool(getattr(runner, "is_draft_worker", False))
+        if self.logical_compressed:
+            if self.req_to_token_pool is None or self.token_to_kv_pool is None:
+                raise RuntimeError(
+                    "QSA logical compressed mapping needs the request and KV pools"
+                )
+            # A draft worker owns a replica KV pool over the target's loc
+            # space and writes/reads its own compressed keys there; it keeps
+            # the full-slot-derived mapping (see the metadata build below)
+            # instead of claiming a second node-owned page space on the shared
+            # request pool.
+            if not self.is_draft_worker:
+                self.compressed_page_cache = attach_qsa_compressed_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool
+                )
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
@@ -285,7 +316,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             # DP token padding rows belong to no request; alias them to request row 0,
             # as the CUDA-graph layout does, so gathers stay in bounds.
             repeats = extend_seq_lens[:batch_size].to(dtype=torch.long)
-            real_rows = int(repeats.sum().item())
+            # Host-side lens when present: a device sum would synchronize the
+            # host on every speculative forward (verify + draft extend).
+            cpu_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if cpu_lens is not None:
+                real_rows = int(sum(int(value) for value in cpu_lens[:batch_size]))
+            else:
+                real_rows = int(repeats.sum().item())
             if real_rows > num_rows:
                 raise ValueError(
                     "QSA speculative query rows are fewer than the extend "
@@ -457,15 +494,35 @@ class QwenSparseAttnBackend(AttentionBackend):
         compress_ratio,
         row_token_starts=None,
         prefix_lens=None,
+        compressed_page_table=None,
+        compressed_page_size=None,
+        compressed_tail_lo_pages=None,
+        compressed_tail_hi_pages=None,
     ):
         """Compact per-row block ranges into ``capacity`` write entries,
-        a shape-derived bound (no sync); padding writes the inert reserved slot 0."""
-        device = token_slot_table.device
+        a shape-derived bound (no sync); padding writes the inert reserved slot 0.
+
+        ``compressed_page_table`` switches the destination from the
+        physical ``full_slot // ratio`` identity to the logical page table
+        (one row per request row, page ids from the compressed allocator).
+        ``compressed_tail_lo_pages``/``compressed_tail_hi_pages`` (indexed by
+        the metadata row) additionally assert that every write lands in the
+        request-owned tail of that row."""
+        device = (
+            compressed_page_table.device
+            if compressed_page_table is not None
+            else token_slot_table.device
+        )
         # The table width is a host-side bound;
         # assert on device so a short table fails loudly without a sync.
-        torch._assert_async(
-            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
-        )
+        if compressed_page_table is None:
+            torch._assert_async(
+                (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
+            )
+        else:
+            torch._assert_async(
+                (end_blocks <= compressed_page_table.shape[1] * compressed_page_size).all()
+            )
         counts = (end_blocks - start_blocks).clamp_min(0)
         ends = torch.cumsum(counts, 0)
         starts = ends - counts
@@ -475,11 +532,32 @@ class QwenSparseAttnBackend(AttentionBackend):
         valid = entries < ends[-1] if counts.numel() else entries < 0
         rows = torch.where(valid, rows.clamp_max(max(counts.numel() - 1, 0)), 0)
         blocks = torch.where(valid, start_blocks[rows] + entries - starts[rows], 0)
-        write_locs = torch.where(
-            valid,
-            token_slot_table[rows, blocks * compress_ratio].long() // compress_ratio,
-            torch.zeros_like(blocks),
-        ).to(torch.int32)
+        if compressed_page_table is None:
+            write_locs = torch.where(
+                valid,
+                token_slot_table[rows, blocks * compress_ratio].long() // compress_ratio,
+                torch.zeros_like(blocks),
+            ).to(torch.int32)
+        else:
+            cps = int(compressed_page_size)
+            page_index = (blocks // cps).clamp_min(0)
+            page_ids = compressed_page_table[rows].long().gather(
+                1, page_index.unsqueeze(1)
+            ).squeeze(1)
+            if compressed_tail_lo_pages is not None:
+                # write_targets subset of request.cp_tail: a write into the
+                # shared prefix (or a detached entry) would corrupt a page a
+                # node or another reader owns.
+                tail_lo = compressed_tail_lo_pages[rows].long()
+                tail_hi = compressed_tail_hi_pages[rows].long()
+                in_tail = ((page_index >= tail_lo) & (page_index < tail_hi)) | (~valid)
+                torch._assert_async(in_tail.all())
+            page_ids = page_ids.clamp_min(0)
+            write_locs = torch.where(
+                valid,
+                page_ids * cps + (blocks % cps),
+                torch.zeros_like(blocks),
+            ).to(torch.int32)
         group_end_positions = blocks * compress_ratio + (compress_ratio - 1)
         member_rows = None
         if row_token_starts is not None:
@@ -499,6 +577,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         speculative_paged: bool,
         token_slot_table,
         sequence_lengths,
+        compressed_page_table=None,
+        compressed_page_size=None,
+        compressed_tail_lo_pages=None,
+        compressed_tail_hi_pages=None,
     ):
         ratio = self.token_to_kv_pool.qsa_compress_ratio
         lengths = sequence_lengths.long()
@@ -513,6 +595,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 end_blocks=end_blocks,
                 capacity=int(lengths.numel()),
                 compress_ratio=ratio,
+                compressed_page_table=compressed_page_table,
+                compressed_page_size=compressed_page_size,
+                compressed_tail_lo_pages=compressed_tail_lo_pages,
+                compressed_tail_hi_pages=compressed_tail_hi_pages,
             )
         extend_lens = forward_batch.extend_seq_lens
         if extend_lens is None:
@@ -535,6 +621,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_ratio=ratio,
             row_token_starts=row_token_starts,
             prefix_lens=prefix_lens,
+            compressed_page_table=compressed_page_table,
+            compressed_page_size=compressed_page_size,
+            compressed_tail_lo_pages=compressed_tail_lo_pages,
+            compressed_tail_hi_pages=compressed_tail_hi_pages,
         )
 
     def _metadata_from_forward_batch(self, forward_batch) -> QwenSparseAttnMetadata:
@@ -635,12 +725,45 @@ class QwenSparseAttnBackend(AttentionBackend):
         pending_ring_slots = None
         compress_group_ring_locs = None
         extend_rope_matrix = None
+        compressed_page_cache = get_qsa_compressed_page_cache(
+            self.token_to_kv_pool
+        )
+        if self.logical_compressed and compressed_page_cache is None:
+            if not self.is_draft_worker:
+                raise RuntimeError(
+                    "QSA logical compressed mapping is enabled but the KV pool "
+                    "has no compressed page table"
+                )
+            # Draft replica pool: its loc space mirrors the target's, so the
+            # full-slot-derived compressed slot addresses the draft's own
+            # entries consistently (the draft wrote them in this slot space).
+        logical_page_table = None
+        write_tail_lo_pages = None
+        write_tail_hi_pages = None
+        if compressed_page_cache is not None:
+            logical_page_table = compressed_page_cache.page_table(
+                row_req_pool_indices
+            )
+            write_tail_lo_pages = compressed_page_cache.tail_lo_pages_table(
+                row_req_pool_indices
+            )
+            write_tail_hi_pages = compressed_page_cache.tail_hi_pages_table(
+                row_req_pool_indices
+            )
         write_locs, group_positions, group_sequence_ids, group_member_rows = (
             self._qsa_build_write_plan(
                 forward_batch=forward_batch,
                 speculative_paged=speculative_paged,
                 token_slot_table=token_slot_table,
                 sequence_lengths=sequence_lengths,
+                compressed_page_table=logical_page_table,
+                compressed_page_size=(
+                    int(self.token_to_kv_pool.qsa_compressed_page_size)
+                    if logical_page_table is not None
+                    else None
+                ),
+                compressed_tail_lo_pages=write_tail_lo_pages,
+                compressed_tail_hi_pages=write_tail_hi_pages,
             )
         )
         decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
@@ -661,12 +784,51 @@ class QwenSparseAttnBackend(AttentionBackend):
         if not self.should_reuse_mtp_sparse_indices(forward_batch):
             if decode_like:
                 pool = self.token_to_kv_pool
-                decode_page_table, decode_lengths = compressed_decode_view(
-                    compressed_page_size=pool.qsa_compressed_page_size,
-                    compress_ratio=pool.qsa_compress_ratio,
-                    sequence_lengths=sequence_lengths,
-                    token_slot_table=token_slot_table,
-                )
+                if logical_page_table is not None:
+                    # Width from the host-side seq lens, like the physical view
+                    # (a device max would sync the host on every verify step).
+                    if _SYNC_WIDTH_FILE and os.path.exists(_SYNC_WIDTH_FILE):
+                        pages = (
+                            sequence_lengths.long() + page_size - 1
+                        ) // page_size
+                        max_pages = max(1, int(pages.max().item()))
+                    elif forward_batch.seq_lens_cpu is not None:
+                        max_len = int(
+                            forward_batch.seq_lens_cpu[: sequence_lengths.numel()].max()
+                        )
+                        if speculative_paged:
+                            max_len += int(
+                                getattr(
+                                    getattr(forward_batch, "spec_info", None),
+                                    "draft_token_num",
+                                    0,
+                                )
+                                or 0
+                            )
+                        max_pages = max(
+                            1,
+                            (max_len + page_size - 1) // page_size,
+                        )
+                        max_pages = min(
+                            max_pages, logical_page_table.shape[1]
+                        )
+                    else:
+                        max_pages = logical_page_table.shape[1]
+                    decode_page_table = (
+                        logical_page_table[:, :max_pages].clamp_min(0).to(torch.int32)
+                    )
+                    decode_lengths = torch.div(
+                        sequence_lengths,
+                        int(pool.qsa_compress_ratio),
+                        rounding_mode="floor",
+                    )
+                else:
+                    decode_page_table, decode_lengths = compressed_decode_view(
+                        compressed_page_size=pool.qsa_compressed_page_size,
+                        compress_ratio=pool.qsa_compress_ratio,
+                        sequence_lengths=sequence_lengths,
+                        token_slot_table=token_slot_table,
+                    )
             pending_ring_slots = build_pending_ring_slots(
                 token_to_batch_idx=token_to_batch_idx,
                 req_pool_indices=row_req_pool_indices,
@@ -711,6 +873,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
+            compressed_page_table=logical_page_table,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -972,12 +1135,14 @@ class QwenSparseAttnBackend(AttentionBackend):
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
         if self.req_to_token is None:
             return False
+        pool = metadata.indexer_metadata.token_to_kv_pool
+        logical = get_qsa_compressed_page_cache(pool) is not None
         from sglang.srt.layers.attention.qsa.graph_metadata import (
             supports_graph_metadata_kernels,
         )
 
         return seq_lens.is_cuda and supports_graph_metadata_kernels(
-            metadata.indexer_metadata.token_to_kv_pool, seq_lens.device
+            pool, seq_lens.device, logical=logical
         )
 
     def _stage_extend_lens(self, spec_info, bs: int, num_tokens: int):
@@ -1040,6 +1205,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             mode = 0
             extend_lens = None
             extend_len = 0
+        logical_page_cache = get_qsa_compressed_page_cache(pool)
         launch_graph_metadata(
             mode=mode,
             bs=bs,
@@ -1052,7 +1218,34 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata=metadata,
             req_to_token=self.req_to_token,
             pool=pool,
+            logical_page_cache=logical_page_cache,
         )
+        if logical_page_cache is not None and not (
+            _ASSERT_DISABLE_FILE and os.path.exists(_ASSERT_DISABLE_FILE)
+        ):
+            # write_targets subset of request.cp_tail (the kernel wrote the
+            # logical write locs; this only audits them).  The file check is a
+            # same-boot attribution knob; unset means always audit.
+            self._assert_qsa_logical_write_tail(metadata, logical_page_cache)
+
+    @staticmethod
+    def _assert_qsa_logical_write_tail(metadata, page_cache) -> None:
+        indexer = metadata.indexer_metadata
+        lengths = indexer.sequence_lengths.long()
+        ratio = int(indexer.compress_ratio)
+        cps = int(page_cache.cps)
+        rows = metadata.row_req_pool_indices.long()
+        boundary = (lengths % ratio == 0) & (lengths > 0)
+        block = (lengths // ratio - 1).clamp_min(0)
+        page_index = (block // cps).clamp_min(0)
+        tail_lo = page_cache.tail_lo_pages_table(rows).long()
+        tail_hi = page_cache.tail_hi_pages_table(rows).long()
+        in_tail = (
+            ((page_index >= tail_lo) & (page_index < tail_hi))
+            | ~boundary
+            | (tail_hi <= 0)
+        )
+        torch._assert_async(in_tail.all())
 
     def _update_qsa_cuda_graph_metadata(
         self, metadata: QSAIndexerMetadata, req_pool_indices: torch.Tensor
@@ -1064,22 +1257,60 @@ class QwenSparseAttnBackend(AttentionBackend):
         lengths = metadata.sequence_lengths.long()
         req_indices = req_pool_indices.long()
         ratio = metadata.compress_ratio
-        full_page = pool.qsa_compressed_page_size * ratio
 
         current_positions = (lengths - 1).clamp_min(0)
         compressed_lengths = torch.div(lengths, ratio, rounding_mode="floor")
         metadata.graph_compressed_lengths.copy_(compressed_lengths.to(torch.int32))
 
-        # Boundary rows write their group's slot (last raw slot // ratio);
-        # every other row keeps the inert reserved slot 0.
+        # Page-table entries are compressed page ids: from the logical
+        # per-request table, or full-KV page ids from the token-slot rows.
+        page_table = metadata.graph_compressed_page_table
+        max_pages = page_table.shape[1]
+        full_page = pool.qsa_compressed_page_size * ratio
+        row_width_pages = self.req_to_token.shape[1] // full_page
+        num_pages = min(max_pages, row_width_pages)
+        compressed_page_cache = get_qsa_compressed_page_cache(pool)
+
+        # Boundary rows write their group's slot; every other row keeps the
+        # inert reserved slot 0.
         boundary = (lengths % ratio == 0) & (lengths > 0)
-        last_locs = self.req_to_token[req_indices, current_positions].long()
-        write_locs = torch.where(
-            boundary,
-            last_locs // ratio,
-            torch.zeros_like(lengths),
-        )
+        block = (compressed_lengths - 1).clamp_min(0)
+        if compressed_page_cache is not None:
+            cps = int(pool.qsa_compressed_page_size)
+            table = compressed_page_cache.page_table(req_indices)[:, :num_pages]
+            page_index = (block // cps).clamp_min(0)
+            col = page_index.clamp_max(num_pages - 1)
+            page_ids = table.long().gather(1, col.unsqueeze(1)).squeeze(1)
+            tail_lo = compressed_page_cache.tail_lo_pages_table(req_indices).long()
+            tail_hi = compressed_page_cache.tail_hi_pages_table(req_indices).long()
+            # write_targets subset of request.cp_tail; rows with no allocation
+            # (graph warmup padding) are inert.
+            in_tail = (
+                ((page_index >= tail_lo) & (page_index < tail_hi))
+                | ~boundary
+                | (tail_hi <= 0)
+            )
+            torch._assert_async(in_tail.all())
+            write_locs = torch.where(
+                boundary,
+                page_ids.clamp_min(0) * cps + (block % cps),
+                torch.zeros_like(lengths),
+            )
+        else:
+            last_locs = self.req_to_token[req_indices, current_positions].long()
+            write_locs = torch.where(
+                boundary,
+                last_locs // ratio,
+                torch.zeros_like(lengths),
+            )
+            table = (
+                self.req_to_token[
+                    req_indices, : num_pages * full_page : full_page
+                ].long()
+                // full_page
+            )
         metadata.graph_write_locs.copy_(write_locs.to(torch.int32))
+        page_table[:, :num_pages].copy_(table.to(torch.int32).clamp_min(0))
 
         metadata.decode_logical_positions.copy_(current_positions.to(torch.int32))
         metadata.pending_ring_slots.copy_(
@@ -1101,16 +1332,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             ).to(torch.int32)
         )
 
-        # Page-table entries are full-KV page ids from the token-slot rows.
-        page_table = metadata.graph_compressed_page_table
-        max_pages = page_table.shape[1]
-        row_width_pages = self.req_to_token.shape[1] // full_page
-        num_pages = min(max_pages, row_width_pages)
-        table = (
-            self.req_to_token[req_indices, : num_pages * full_page : full_page].long()
-            // full_page
-        ).clamp_min(0)
-        page_table[:, :num_pages].copy_(table.to(torch.int32))
 
     def get_indexer_metadata(self, layer_id: int, forward_batch):
         if self.forward_metadata is None:

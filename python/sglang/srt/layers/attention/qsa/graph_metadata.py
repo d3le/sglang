@@ -110,24 +110,38 @@ def _qsa_graph_row_metadata_kernel(
     req_to_token_ptr,
     req_to_token_row_stride,
     max_pages,
+    # Logical compressed page table: one row per request pool slot.
+    req_pages_ptr,
+    req_pages_row_stride,
     RATIO: tl.constexpr,
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
+    CPS: tl.constexpr,  # compressed slots per page
     PAGE_BLOCK: tl.constexpr,
+    LOGICAL: tl.constexpr,
 ):
     row = tl.program_id(0)
     seq_len = tl.load(row_seq_lens_ptr + row).to(tl.int32)
     req = tl.load(row_req_pool_ptr + row).to(tl.int64)
     token_row = req * req_to_token_row_stride
     current = tl.maximum(seq_len - 1, 0)
-    last_loc = tl.load(req_to_token_ptr + token_row + current).to(tl.int32)
 
     compressed = seq_len // RATIO
     tl.store(compressed_lens_ptr + row, compressed)
 
-    # The page-aligned allocator keeps each compression group inside one page,
-    # so last_loc // RATIO is the group's compressed slot; slot 0 is the padding slot.
+    # A boundary row completes its group.  The physical path derives the
+    # compressed slot from the request's full-KV slot (full_slot // ratio);
+    # the logical path reads the request's own page table instead, so a write
+    # can never land in a node-owned shared page.
     boundary = (seq_len > 0) & (seq_len % RATIO == 0)
-    write_loc = tl.where(boundary, last_loc // RATIO, 0)
+    if LOGICAL:
+        logical_row = req_pages_ptr + req * req_pages_row_stride
+        block = tl.maximum(compressed - 1, 0)
+        page_index = tl.minimum(block // CPS, max_pages - 1)
+        page_id = tl.load(logical_row + page_index).to(tl.int32)
+        write_loc = tl.where(boundary, page_id * CPS + (block % CPS), 0)
+    else:
+        last_loc = tl.load(req_to_token_ptr + token_row + current).to(tl.int32)
+        write_loc = tl.where(boundary, last_loc // RATIO, 0)
     tl.store(write_locs_ptr + row, write_loc)
 
     tl.store(logical_positions_ptr + row, current)
@@ -138,27 +152,43 @@ def _qsa_graph_row_metadata_kernel(
         slot = req * RATIO + (member % RATIO).to(tl.int64)
         tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
 
-    # Page-table entries are the request's FULL-KV page ids, read from the
-    # page-aligned req_to_token row; the scoring kernels turn them into
-    # compressed slots as page_id * (FULL_PAGE // RATIO) + block_in_page.
+    # Page-table entries are compressed page ids.  Physical: the request's
+    # FULL-KV page ids from the page-aligned req_to_token row.  Logical: the
+    # request's own page table (shared node pages followed by the tail).
     table_row = page_table_ptr + row.to(tl.int64) * max_pages
     offs = tl.arange(0, PAGE_BLOCK)
-    row_width_pages = req_to_token_row_stride // FULL_PAGE
-    for p0 in range(0, max_pages, PAGE_BLOCK):
-        idx = p0 + offs
-        valid = idx < tl.minimum(max_pages, row_width_pages)
-        loc = tl.load(
-            req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0
-        )
-        tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
+    if LOGICAL:
+        logical_row = req_pages_ptr + req * req_pages_row_stride
+        for p0 in range(0, max_pages, PAGE_BLOCK):
+            idx = p0 + offs
+            valid = idx < max_pages
+            page = tl.load(logical_row + idx, mask=valid, other=0)
+            tl.store(table_row + idx, tl.maximum(page, 0), mask=valid)
+    else:
+        row_width_pages = req_to_token_row_stride // FULL_PAGE
+        for p0 in range(0, max_pages, PAGE_BLOCK):
+            idx = p0 + offs
+            valid = idx < tl.minimum(max_pages, row_width_pages)
+            loc = tl.load(
+                req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0
+            )
+            tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
 
 
-def supports_graph_metadata_kernels(pool, device) -> bool:
-    """Whether the CUDA fast path can serve this pool/device pair."""
+def supports_graph_metadata_kernels(pool, device, *, logical: bool = False) -> bool:
+    """Whether the CUDA fast path can serve this pool/device pair.
+
+    ``logical`` selects the compressed-page-table variant of the row kernel,
+    which the same launch path provides.
+    """
 
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
-    return torch.device(device).type == "cuda" and isinstance(pool, QSATokenToKVPool)
+    if torch.device(device).type != "cuda" or not isinstance(pool, QSATokenToKVPool):
+        return False
+    if logical:
+        return getattr(pool, "qsa_compressed_page_cache", None) is not None
+    return True
 
 
 def launch_graph_metadata(
@@ -174,6 +204,7 @@ def launch_graph_metadata(
     metadata,
     req_to_token,
     pool,
+    logical_page_cache=None,
 ) -> None:
 
     indexer = metadata.indexer_metadata
@@ -200,6 +231,14 @@ def launch_graph_metadata(
         MODE=mode,
         num_warps=1,
     )
+    logical = logical_page_cache is not None
+    if logical:
+        req_pages = logical_page_cache.req_pages
+        req_pages_stride = req_pages.stride(0)
+    else:
+        # Unused pointers for the physical variant.
+        req_pages = req_to_token
+        req_pages_stride = 0
     _qsa_graph_row_metadata_kernel[(num_rows,)](
         row_seq_lens,
         row_req_pool,
@@ -212,8 +251,12 @@ def launch_graph_metadata(
         req_to_token,
         req_to_token.stride(0),
         max_pages,
+        req_pages,
+        req_pages_stride,
         RATIO=indexer.compress_ratio,
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
+        CPS=pool.qsa_compressed_page_size,
         PAGE_BLOCK=128,
+        LOGICAL=logical,
         num_warps=1,
     )

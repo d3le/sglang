@@ -10,6 +10,8 @@ class ComponentType(int, Enum):
     SWA = 1
     MAMBA = 2
     C128 = 3
+    # QSA compressed-K pages owned by the radix nodes (Qwen4-Exp stage 2).
+    QSA_CP = 4
 
     def __str__(self) -> str:  # keep human-readable logging
         return self.name.lower()
@@ -25,6 +27,10 @@ class ComponentType(int, Enum):
     @property
     def is_mamba(self) -> bool:
         return self == ComponentType.MAMBA
+
+    @property
+    def is_qsa_cp(self) -> bool:
+        return self == ComponentType.QSA_CP
 
 
 BASE_COMPONENT_TYPE = ComponentType.FULL
