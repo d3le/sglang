@@ -137,7 +137,10 @@ def chunk_fwd_o(
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    # Keep the full chunk tile for short extends too: a smaller tile changes the
+    # accumulation of the intra-chunk product, so the same token got different
+    # output bits as the tail of a prefix hit (T < 64) than inside a long prefill.
+    BT = chunk_size
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
