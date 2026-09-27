@@ -42,6 +42,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
+    # The chunk kernel writes the fp32 track snapshot (not on CPU/NPU).
+    supports_track_state_snapshot: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
@@ -200,6 +202,15 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
+        # fp32 snapshot of the recurrent state at the tracked chunk boundary
+        # (chunk_gated_delta_rule_fwd_h writes it in-kernel); the per-chunk h
+        # it would otherwise be read from is rounded to the activation dtype.
+        track_args = {}
+        if kwargs.get("track_state") is not None and not (is_cpu() or is_npu()):
+            track_args = {
+                "track_state": kwargs["track_state"],
+                "track_chunk_idx": kwargs["track_chunk_idx"],
+            }
         return chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -212,6 +223,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **track_args,
         )
 
     def target_verify(
