@@ -775,11 +775,17 @@ def alloc_for_spec_decode(
             len(reqs),
         )
 
-    req_to_token_pool.alloc_aux_to_lengths(
-        req_pool_indices_cpu=req_pool_indices.to("cpu"),
-        target_seq_lens_cpu=nxt_kv_lens_cpu,
-        reqs=reqs,
-    )
+    if getattr(req_to_token_pool, "_aux_cache", None) is not None:
+        # Row indices from the host-side request state: req_pool_indices lives
+        # on the device, and a blocking .to("cpu") here would stall the host
+        # on the in-flight forward every speculative step.
+        req_to_token_pool.alloc_aux_to_lengths(
+            req_pool_indices_cpu=torch.tensor(
+                [req.kv.req_pool_idx for req in reqs], dtype=torch.int64
+            ),
+            target_seq_lens_cpu=nxt_kv_lens_cpu,
+            reqs=reqs,
+        )
 
     nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
     for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
