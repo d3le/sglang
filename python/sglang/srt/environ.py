@@ -316,6 +316,15 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # Reuse a validated file-backed PLE table across boots instead of rewriting
+    # the whole table from the checkpoint every startup. Off by default; the
+    # manifest records the source shard metadata and is only trusted when it
+    # matches exactly. FORCE_REBUILD ignores a matching manifest once (useful
+    # after changing the table-building code). LOCK_TIMEOUT_S is how long to
+    # wait for the per-table advisory lock before failing (0 = fail fast).
+    SGLANG_QWEN4_PLE_FILE_REUSE = EnvBool(False)
+    SGLANG_QWEN4_PLE_FILE_REUSE_FORCE_REBUILD = EnvBool(False)
+    SGLANG_QWEN4_PLE_FILE_REUSE_LOCK_TIMEOUT_S = EnvFloat(0.0)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

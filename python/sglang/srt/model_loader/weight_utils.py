@@ -1126,6 +1126,19 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+# Predicates consulted before a checkpoint tensor is materialized. A predicate
+# returning True means another mechanism (for example a validated on-host cache)
+# already provides the value, so the tensor must not be read from the
+# checkpoint. Hooks must be cheap and side-effect free.
+WEIGHT_KEY_SKIP_HOOKS: List[Callable[[str], bool]] = []
+
+
+def _skip_weight_key(name: str) -> bool:
+    if not WEIGHT_KEY_SKIP_HOOKS:
+        return False
+    return any(hook(name) for hook in WEIGHT_KEY_SKIP_HOOKS)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
@@ -1158,6 +1171,8 @@ def safetensors_weights_iterator(
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if _skip_weight_key(name):
+                        continue
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
@@ -1248,7 +1263,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 result = safetensors.torch.load(f.read())
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    k: f.get_tensor(k) for k in f.keys() if not _skip_weight_key(k)
+                }
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

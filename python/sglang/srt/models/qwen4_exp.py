@@ -64,6 +64,7 @@ from sglang.srt.models.qwen3_5 import (
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
+    finalize_ple_table_reuse,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
@@ -798,6 +799,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         *,
         backend: str = "pinned",
         table_dir: Optional[str] = None,
+        source_dir: Optional[str] = None,
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
@@ -825,11 +827,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             dtype=source_weight.dtype,
             backend=backend,
             table_dir=table_dir,
+            source_dir=source_dir,
             # Each TP rank holds a different vocabulary shard of the same shape.
             tag=(
                 f"rows{self.shard_indices.org_vocab_start_index}"
                 f"-{self.shard_indices.org_vocab_end_index}"
             ),
+        )
+        # load_weights reads this from the module: the flag set on host_table
+        # does not survive wrapping the table in an nn.Parameter.
+        self._sglang_ple_reuse_valid = bool(
+            getattr(host_table, "_sglang_ple_reuse_valid", False)
         )
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
@@ -936,6 +944,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 self.ple_embedding.ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
                 table_dir=getattr(config, "ple_offload_dir", None),
+                source_dir=getattr(config, "ple_offload_source_dir", None),
             )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (
@@ -2166,6 +2175,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         continue
             loaded_params.add(name)
 
+        for module_prefix, ple_module in ple_modules.items():
+            embedding = getattr(ple_module, "ngram_embedding", None)
+            if getattr(embedding, "_sglang_ple_reuse_valid", False):
+                # The table was validated and reused, so the shard tensors were
+                # intentionally never read from the checkpoint.
+                loaded_shard_params.add(f"{module_prefix}.ngram_embedding.weight")
+
         loaded_params.update(loaded_buffers)
         loaded_params.update(loaded_shard_params)
 
@@ -2178,6 +2194,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
+
+        finalize_ple_table_reuse()
 
         return loaded_params
 

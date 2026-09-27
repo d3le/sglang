@@ -292,6 +292,10 @@ def load_model_with_memory_saver(
                     get_exec().offload.ple_offload_dir
                     or default_ple_table_dir(get_model().model_path)
                 )
+                # Source checkpoint for the validated-reuse manifest.
+                model_config.hf_text_config.ple_offload_source_dir = (
+                    model_config.model_path
+                )
                 if ple_offload_embedding and device == "cuda":
                     check_file_backend_supported(
                         torch.cuda.current_device() if torch.cuda.is_available() else 0
